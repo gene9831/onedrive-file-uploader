@@ -1,0 +1,21 @@
+{
+  "name": "onedrive-file-uploader",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "format": "prettier --write --list-different .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "@microsoft/microsoft-graph-types": "^2.43.1",
+    "@types/bun": "latest",
+    "prettier": "^3.6.2"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^3.8.1"
+  }
+}
