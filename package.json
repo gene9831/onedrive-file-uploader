@@ -10,12 +10,14 @@
   "devDependencies": {
     "@microsoft/microsoft-graph-types": "^2.43.1",
     "@types/bun": "latest",
+    "@types/cli-progress": "^3.11.6",
     "prettier": "^3.6.2"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "@azure/msal-node": "^3.8.1"
+    "@azure/msal-node": "^3.8.1",
+    "cli-progress": "^3.12.0"
   }
 }

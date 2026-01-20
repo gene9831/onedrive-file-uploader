@@ -1,6 +1,10 @@
 import type { User } from "@microsoft/microsoft-graph-types";
 import { calculateQuickXorHash } from "./quickxorhash";
 import { GraphClient } from "./graph";
+import { UploadQueue } from "./upload-queue";
+import { readdir } from "node:fs/promises";
+import path from "node:path";
+import cliProgress from "cli-progress";
 
 const clientId = process.env.CLIENT_ID;
 const clientSecret = process.env.CLIENT_SECRET;
@@ -122,33 +126,26 @@ async function promptUserSelection() {
 }
 
 /**
- * Main function - checks if USER_ID is set and acts accordingly
+ * Handle upload command
  */
-async function main() {
-  const args = Bun.argv;
-
-  if (args.length < 4) {
-    console.error("Usage: bun index.ts <file> <directory>");
-    process.exit(1);
-  }
-
-  const filePath = args[2]!;
-  const directory = args[3]!;
-
+async function handleUpload(filePath: string, directory: string) {
   const fileExists = await Bun.file(filePath).exists();
   if (!fileExists) {
     console.error(`File not found: ${filePath}`);
     process.exit(1);
   }
 
+  const file = Bun.file(filePath);
+  const fileSize = file.size;
+  const MAX_DIRECT_UPLOAD_SIZE = 5 * 1024 * 1024; // 5MB
+
   console.log(`File: ${filePath}`);
   console.log(`Directory: ${directory}`);
+  console.log(`File size: ${formatBytes(fileSize)}`);
 
   const userId = process.env.USER_ID;
 
-  // Check if USER_ID environment variable is set
   if (!userId) {
-    // USER_ID not set - list all users and prompt user to select one
     await promptUserSelection();
     process.exit(0);
   }
@@ -159,37 +156,321 @@ async function main() {
   const quickXorHash = await calculateQuickXorHash(filePath);
   console.log(`QuickXorHash: ${quickXorHash}`);
 
-  const uploadSession = await graphClient.createUploadSession(
-    filePath,
-    directory
-  );
+  let driveItem;
 
-  console.log("🚀 Starting upload...");
+  if (fileSize <= MAX_DIRECT_UPLOAD_SIZE) {
+    console.log("🚀 Starting direct upload (file size <= 5MB)...");
+    driveItem = await graphClient.uploadFile(filePath, directory);
+  } else {
+    console.log("🚀 Starting chunked upload (file size > 5MB)...");
+    const uploadSession = await graphClient.createUploadSession(
+      filePath,
+      directory
+    );
 
-  const driveItem = await graphClient.uploadFileToSession(
-    filePath,
-    uploadSession,
-    (progress: {
-      uploaded: number;
-      total: number;
-      percentage: string;
-      speed: number;
-      eta: number;
-    }) => {
-      console.log(
-        `⬆️ Uploaded: ${formatBytes(progress.uploaded)} / ${formatBytes(progress.total)} [${progress.percentage}%] [${formatBytes(progress.speed)}/s] [ETA ${formatSeconds(progress.eta)}]`
-      );
-    }
-  );
+    const progressBar = new cliProgress.SingleBar(
+      {
+        format:
+          "⬆️ Uploading |{bar}| {percentage}% | {value}/{total} | Speed: {speed} | ETA: {eta_formatted}",
+        barCompleteChar: "\u2588",
+        barIncompleteChar: "\u2591",
+        hideCursor: true,
+      },
+      cliProgress.Presets.shades_classic
+    );
 
-  const { id, name, size, file, parentReference } = driveItem;
+    progressBar.start(fileSize, 0, {
+      speed: "N/A",
+      eta_formatted: "N/A",
+    });
+
+    driveItem = await graphClient.uploadFileToSession(
+      filePath,
+      uploadSession,
+      (progress: {
+        uploaded: number;
+        total: number;
+        percentage: string;
+        speed: number;
+        eta: number;
+      }) => {
+        progressBar.update(progress.uploaded, {
+          speed: `${formatBytes(progress.speed)}/s`,
+          eta_formatted: formatSeconds(progress.eta),
+        });
+        progressBar.setTotal(progress.total);
+      }
+    );
+
+    progressBar.update(fileSize, {
+      speed: "Complete",
+      eta_formatted: "Done",
+    });
+    progressBar.stop();
+  }
+
+  const { id, name, size, file: fileInfo, parentReference } = driveItem;
   console.log(`✅ Uploaded file:`);
   console.log({ id, name, size, directory: parentReference?.path });
 
-  if (file?.hashes?.quickXorHash && quickXorHash !== file.hashes.quickXorHash) {
+  if (
+    fileInfo?.hashes?.quickXorHash &&
+    quickXorHash !== fileInfo.hashes.quickXorHash
+  ) {
     console.warn("⚠️ QuickXorHash mismatch");
     console.warn(`Expected: ${quickXorHash}`);
-    console.warn(`Actual: ${file.hashes.quickXorHash}`);
+    console.warn(`Actual: ${fileInfo.hashes.quickXorHash}`);
+  }
+}
+
+async function handleList(directory: string) {
+  const userId = process.env.USER_ID;
+
+  if (!userId) {
+    await promptUserSelection();
+    process.exit(0);
+  }
+
+  graphClient.setUserId(userId);
+
+  const files = await graphClient.listDirectory(directory);
+  console.log(`Found ${files.length} files in directory: ${directory}`);
+  console.log(files);
+}
+
+/**
+ * Recursively get all files in a directory using Bun API
+ */
+async function getAllFiles(
+  dirPath: string,
+  basePath: string = dirPath
+): Promise<Array<{ filePath: string; relativePath: string; size: number }>> {
+  const files: Array<{ filePath: string; relativePath: string; size: number }> =
+    [];
+  const entries = await readdir(dirPath, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") || entry.name.startsWith("_")) {
+      continue;
+    }
+
+    const fullPath = path.join(dirPath, entry.name);
+    const relativePath = path.relative(basePath, fullPath);
+
+    if (entry.isDirectory()) {
+      const subFiles = await getAllFiles(fullPath, basePath);
+      files.push(...subFiles);
+    } else if (entry.isFile()) {
+      const file = Bun.file(fullPath);
+      const size = file.size;
+      files.push({ filePath: fullPath, relativePath, size });
+    }
+  }
+
+  return files;
+}
+
+/**
+ * Handle upload directory command with queue and concurrency control
+ */
+async function handleUploadDirectory(
+  localDirPath: string,
+  remoteDirectory: string
+) {
+  try {
+    await readdir(localDirPath);
+  } catch (error) {
+    console.error(`Directory not found: ${localDirPath}`);
+    process.exit(1);
+  }
+
+  console.log(`Local directory: ${localDirPath}`);
+  console.log(`Remote directory: ${remoteDirectory}`);
+  console.log("📂 Scanning directory...\n");
+
+  const files = await getAllFiles(localDirPath);
+  console.log(`Found ${files.length} files to upload\n`);
+
+  if (files.length === 0) {
+    console.log("No files to upload.");
+    return;
+  }
+
+  const userId = process.env.USER_ID;
+
+  if (!userId) {
+    await promptUserSelection();
+    process.exit(0);
+  }
+
+  graphClient.setUserId(userId);
+
+  const MAX_DIRECT_UPLOAD_SIZE = 5 * 1024 * 1024;
+  const MAX_CONCURRENT_UPLOADS = 5;
+
+  const sourceDirName = path.basename(path.resolve(localDirPath));
+  const baseTargetDir = remoteDirectory.endsWith("/")
+    ? `${remoteDirectory}${sourceDirName}`
+    : `${remoteDirectory}/${sourceDirName}`;
+
+  const queue = new UploadQueue(MAX_CONCURRENT_UPLOADS, files.length);
+  let completedCount = 0;
+  let failedCount = 0;
+
+  console.log(
+    `🚀 Starting upload with max ${MAX_CONCURRENT_UPLOADS} concurrent uploads...\n`
+  );
+
+  const multibar = new cliProgress.MultiBar(
+    {
+      clearOnComplete: true,
+      hideCursor: true,
+      format:
+        " {bar} | {percentage}% | {value}/{total} | Speed: {speed} | {filename}",
+      barCompleteChar: "\u2588",
+      barIncompleteChar: "\u2591",
+    },
+    cliProgress.Presets.shades_grey
+  );
+
+  const overallBar = multibar.create(files.length, 0, {
+    filename: "📦 Overall Progress",
+    speed: "N/A",
+  });
+
+  const activeBars = new Map<string, cliProgress.SingleBar>();
+  for (let i = 0; i < files.length; i++) {
+    const { filePath, relativePath, size } = files[i]!;
+    const fileDir = path.dirname(relativePath);
+    const targetDir =
+      fileDir === "." ? baseTargetDir : `${baseTargetDir}/${fileDir}`;
+
+    queue.add(async () => {
+      const currentIndex = ++completedCount;
+      const fileBar = multibar.create(size, 0, {
+        filename: `[${currentIndex}/${files.length}] ${relativePath}`,
+        speed: "N/A",
+      });
+      activeBars.set(relativePath, fileBar);
+
+      try {
+        if (size <= MAX_DIRECT_UPLOAD_SIZE) {
+          await graphClient.uploadFile(filePath, targetDir);
+          fileBar.update(size, { speed: "Complete" });
+        } else {
+          const uploadSession = await graphClient.createUploadSession(
+            filePath,
+            targetDir
+          );
+
+          await graphClient.uploadFileToSession(
+            filePath,
+            uploadSession,
+            (progress: {
+              uploaded: number;
+              total: number;
+              percentage: string;
+              speed: number;
+              eta: number;
+            }) => {
+              fileBar.update(progress.uploaded, {
+                speed: `${formatBytes(progress.speed)}/s`,
+              });
+              fileBar.setTotal(progress.total);
+            }
+          );
+          fileBar.update(size, { speed: "Complete" });
+        }
+
+        fileBar.update(size, { speed: "Complete" });
+        fileBar.stop();
+        activeBars.delete(relativePath);
+        overallBar.increment();
+      } catch (error) {
+        failedCount++;
+        fileBar.stop();
+        activeBars.delete(relativePath);
+        overallBar.increment();
+        console.error(
+          `\n❌ Failed to upload ${relativePath}:`,
+          error instanceof Error ? error.message : error
+        );
+        throw error;
+      }
+    });
+  }
+
+  await queue.waitForCompletion();
+  multibar.stop();
+
+  const stats = queue.getStats();
+  console.log(`\n${"=".repeat(100)}`);
+  console.log(`Upload summary:`);
+  console.log(`  ✅ Success: ${stats.success}`);
+  console.log(`  ❌ Failed: ${stats.failed}`);
+  console.log(`  📊 Total: ${stats.total}`);
+  console.log(`${"=".repeat(100)}\n`);
+}
+
+/**
+ * Main function - parses command line arguments and routes to appropriate handler
+ */
+async function main() {
+  const args = Bun.argv;
+
+  if (args.length < 3) {
+    console.error("Usage: bun index.ts <command> [options]");
+    console.error("\nCommands:");
+    console.error("  upload <file> <directory>     Upload a file to OneDrive");
+    console.error(
+      "  upload-dir <dir> <directory>   Upload a directory to OneDrive"
+    );
+    console.error("  list <directory>               List files in a directory");
+    process.exit(1);
+  }
+
+  const command = args[2];
+
+  switch (command) {
+    case "upload":
+      if (args.length < 5) {
+        console.error("Usage: bun index.ts upload <file> <directory>");
+        process.exit(1);
+      }
+      await handleUpload(args[3]!, args[4]!);
+      break;
+
+    case "upload-dir":
+      if (args.length < 5) {
+        console.error(
+          "Usage: bun index.ts upload-dir <local_dir> <remote_directory>"
+        );
+        process.exit(1);
+      }
+      await handleUploadDirectory(args[3]!, args[4]!);
+      break;
+
+    case "list":
+      if (args.length < 4) {
+        console.error("Usage: bun index.ts list <directory>");
+        process.exit(1);
+      }
+      await handleList(args[3]!);
+      break;
+
+    default:
+      console.error(`Unknown command: ${command}`);
+      console.error("\nAvailable commands:");
+      console.error(
+        "  upload <file> <directory>     Upload a file to OneDrive"
+      );
+      console.error(
+        "  upload-dir <dir> <directory>   Upload a directory to OneDrive"
+      );
+      console.error(
+        "  list <directory>               List files in a directory"
+      );
+      process.exit(1);
   }
 }
 

@@ -21,6 +21,8 @@ export class GraphClient {
   private cca: msal.ConfidentialClientApplication;
   private baseUrl = "https://graph.microsoft.com/v1.0";
   private userId?: string;
+  // Promise to share token acquisition across concurrent calls
+  private tokenPromise: Promise<string> | null = null;
 
   constructor(
     private clientId: string,
@@ -70,25 +72,40 @@ export class GraphClient {
   /**
    * Get access token using client credentials flow
    * This requires the application to have User.Read.All or User.ReadWrite.All permissions
+   * Ensures only one token acquisition happens at a time, even with concurrent calls
    */
   async getAccessToken(): Promise<string> {
-    try {
-      const tokenRequest = {
-        scopes: ["https://graph.microsoft.com/.default"],
-      };
-
-      const response =
-        await this.cca.acquireTokenByClientCredential(tokenRequest);
-
-      if (!response || !response.accessToken) {
-        throw new Error("Failed to acquire access token");
-      }
-
-      return response.accessToken;
-    } catch (error) {
-      console.error("Error acquiring token:", error);
-      throw error;
+    // If there's already a token acquisition in progress, wait for it
+    if (this.tokenPromise) {
+      return this.tokenPromise;
     }
+
+    // Create a new token acquisition promise
+    this.tokenPromise = (async () => {
+      try {
+        const tokenRequest = {
+          scopes: ["https://graph.microsoft.com/.default"],
+        };
+
+        const response =
+          await this.cca.acquireTokenByClientCredential(tokenRequest);
+
+        if (!response || !response.accessToken) {
+          throw new Error("Failed to acquire access token");
+        }
+
+        return response.accessToken;
+      } catch (error) {
+        console.error("Error acquiring token:", error);
+        throw error;
+      } finally {
+        // Clear the promise after completion (success or failure)
+        // This allows retry on failure and new token acquisition when needed
+        this.tokenPromise = null;
+      }
+    })();
+
+    return this.tokenPromise;
   }
 
   /**
@@ -301,11 +318,116 @@ export class GraphClient {
   }
 
   /**
+   * Check if an HTTP status code is retryable
+   */
+  private isRetryableStatus(status: number): boolean {
+    // Retry on rate limiting (429), server errors (5xx), and some client errors
+    return (
+      status === 429 || // Too Many Requests
+      status === 500 || // Internal Server Error
+      status === 502 || // Bad Gateway
+      status === 503 || // Service Unavailable
+      status === 504 // Gateway Timeout
+    );
+  }
+
+  /**
+   * Sleep for a given number of milliseconds
+   */
+  private sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * Retry a function with exponential backoff
+   * @param fn Function to retry
+   * @param maxRetries Maximum number of retries (default: 3)
+   * @param initialDelay Initial delay in milliseconds (default: 1000)
+   * @param maxDelay Maximum delay in milliseconds (default: 30000)
+   */
+  private async retryWithBackoff<T>(
+    fn: () => Promise<T>,
+    maxRetries: number = 3,
+    initialDelay: number = 1000,
+    maxDelay: number = 30000
+  ): Promise<T> {
+    let lastError: Error | unknown;
+    let delay = initialDelay;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error;
+
+        // Don't retry on the last attempt
+        if (attempt === maxRetries) {
+          break;
+        }
+
+        // Check if error is retryable
+        let isRetryable = false;
+        if (error instanceof Error) {
+          const errorWithFlags = error as any;
+
+          // Check if it's explicitly marked as a network error
+          if (errorWithFlags.isNetworkError) {
+            isRetryable = true;
+          }
+          // Network errors are retryable (check error message)
+          else if (
+            error.message.includes("fetch") ||
+            error.message.includes("network") ||
+            error.message.includes("ECONNRESET") ||
+            error.message.includes("ETIMEDOUT")
+          ) {
+            isRetryable = true;
+          }
+          // Check if error has status code attached (from HTTP errors)
+          else if (
+            errorWithFlags.status &&
+            typeof errorWithFlags.status === "number"
+          ) {
+            isRetryable = this.isRetryableStatus(errorWithFlags.status);
+          } else {
+            // Fallback: try to extract status from error message
+            const statusMatch = error.message.match(/status[:\s]+(\d+)/i);
+            if (statusMatch) {
+              const status = parseInt(statusMatch[1]!, 10);
+              isRetryable = this.isRetryableStatus(status);
+            }
+          }
+        }
+
+        // If not retryable, throw immediately
+        if (!isRetryable) {
+          throw error;
+        }
+
+        // Calculate exponential backoff with jitter
+        const jitter = Math.random() * 0.3 * delay; // Add up to 30% jitter
+        const backoffDelay = Math.min(delay + jitter, maxDelay);
+
+        console.warn(
+          `⚠️ Upload chunk failed (attempt ${attempt + 1}/${maxRetries + 1}), retrying in ${Math.round(backoffDelay)}ms...`
+        );
+
+        await this.sleep(backoffDelay);
+        delay = Math.min(delay * 2, maxDelay); // Exponential backoff
+      }
+    }
+
+    // If we get here, all retries failed
+    throw lastError;
+  }
+
+  /**
    * Upload file to OneDrive using upload session (for large files)
-   * Supports chunked upload with progress tracking
+   * Supports chunked upload with progress tracking and automatic retry
    * @param filePath Local file path
    * @param session Upload session from createUploadSession
    * @param onProgress Optional progress callback
+   * @param maxRetries Maximum number of retries per chunk (default: 3)
    */
   async uploadFileToSession(
     filePath: string,
@@ -316,7 +438,8 @@ export class GraphClient {
       percentage: string;
       speed: number;
       eta: number;
-    }) => void
+    }) => void,
+    maxRetries: number = 3
   ): Promise<DriveItem> {
     const uploadUrl = session.uploadUrl;
 
@@ -338,25 +461,52 @@ export class GraphClient {
         chunkSize: calculatedChunkSize,
       } = this.calculateBytesRange(fileSize, chunkSize, currentSession);
 
-      // Read specific chunk of the file using slice()
-      const chunk = file.slice(start, end + 1);
+      // Upload this chunk with retry mechanism
+      // Note: We re-read the chunk on each retry attempt since the stream may be consumed
+      const response = await this.retryWithBackoff(
+        async () => {
+          try {
+            // Re-read the chunk from file for each retry attempt
+            const chunk = file.slice(start, end + 1);
 
-      // Upload this chunk
-      const response = await fetch(uploadUrl, {
-        method: "PUT",
-        headers: {
-          "Content-Length": `${calculatedChunkSize}`,
-          "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+            const res = await fetch(uploadUrl, {
+              method: "PUT",
+              headers: {
+                "Content-Length": `${calculatedChunkSize}`,
+                "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+              },
+              body: chunk,
+            });
+
+            if (!res.ok) {
+              const errorText = await res.text();
+              const error = new Error(
+                `Failed to upload chunk: ${res.status} ${res.statusText}\n${errorText}`
+              );
+              // Attach status code to error for retry logic
+              (error as any).status = res.status;
+              throw error;
+            }
+
+            return res;
+          } catch (error) {
+            // Re-throw HTTP errors (already handled above)
+            if (error instanceof Error && (error as any).status) {
+              throw error;
+            }
+            // Wrap network/fetch errors for retry logic
+            const networkError = new Error(
+              `Network error during chunk upload: ${error instanceof Error ? error.message : String(error)}`
+            );
+            // Mark as network error for retry detection
+            (networkError as any).isNetworkError = true;
+            throw networkError;
+          }
         },
-        body: chunk,
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `Failed to upload chunk: ${response.status} ${response.statusText}\n${errorText}`
-        );
-      }
+        maxRetries,
+        1000, // Initial delay: 1 second
+        30000 // Max delay: 30 seconds
+      );
 
       const data = await response.json();
 
@@ -383,5 +533,53 @@ export class GraphClient {
       }
     }
   }
-}
 
+  async listDirectory(
+    directory: string,
+    userId?: string
+  ): Promise<DriveItem[]> {
+    const accessToken = await this.getAccessToken();
+    const normalizedDirectory = GraphClient.normalizeDirectory(directory);
+    const targetUserId = userId ?? this.userId;
+
+    if (!targetUserId) {
+      throw new Error("USER_ID must be provided or set via setUserId()");
+    }
+
+    const driveItemResp = await fetch(
+      `${this.baseUrl}/users/${targetUserId}/drive/items/root:${normalizedDirectory}`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    );
+
+    if (!driveItemResp.ok) {
+      throw new Error(
+        `Failed to list directory: ${driveItemResp.status} ${driveItemResp.statusText}\n${await driveItemResp.text()}`
+      );
+    }
+
+    const fileId = ((await driveItemResp.json()) as DriveItem).id;
+
+    const childrenResp = await fetch(
+      `${this.baseUrl}/users/${targetUserId}/drive/items/${fileId}/children`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      }
+    );
+
+    if (!childrenResp.ok) {
+      throw new Error(
+        `Failed to list children: ${childrenResp.status} ${childrenResp.statusText}\n${await childrenResp.text()}`
+      );
+    }
+
+    const data = (await childrenResp.json()) as { value: DriveItem[] };
+
+    return data.value;
+  }
+}
