@@ -321,24 +321,19 @@ async function handleUploadDirectory(
     `🚀 Starting upload with max ${MAX_CONCURRENT_UPLOADS} concurrent uploads...\n`
   );
 
-  const multibar = new cliProgress.MultiBar(
+  const progressBar = new cliProgress.SingleBar(
     {
-      clearOnComplete: true,
-      hideCursor: true,
       format:
-        " {bar} | {percentage}% | {value}/{total} | Speed: {speed} | {filename}",
+        "📦 Overall Progress |{bar}| {percentage}% | {value}/{total} files",
       barCompleteChar: "\u2588",
       barIncompleteChar: "\u2591",
+      hideCursor: true,
     },
-    cliProgress.Presets.shades_grey
+    cliProgress.Presets.shades_classic
   );
 
-  const overallBar = multibar.create(files.length, 0, {
-    filename: "📦 Overall Progress",
-    speed: "N/A",
-  });
+  progressBar.start(files.length, 0);
 
-  const activeBars = new Map<string, cliProgress.SingleBar>();
   for (let i = 0; i < files.length; i++) {
     const { filePath, relativePath, size } = files[i]!;
     const fileDir = path.dirname(relativePath);
@@ -347,50 +342,22 @@ async function handleUploadDirectory(
 
     queue.add(async () => {
       const currentIndex = ++completedCount;
-      const fileBar = multibar.create(size, 0, {
-        filename: `[${currentIndex}/${files.length}] ${relativePath}`,
-        speed: "N/A",
-      });
-      activeBars.set(relativePath, fileBar);
-
       try {
         if (size <= MAX_DIRECT_UPLOAD_SIZE) {
           await graphClient.uploadFile(filePath, targetDir);
-          fileBar.update(size, { speed: "Complete" });
         } else {
           const uploadSession = await graphClient.createUploadSession(
             filePath,
             targetDir
           );
 
-          await graphClient.uploadFileToSession(
-            filePath,
-            uploadSession,
-            (progress: {
-              uploaded: number;
-              total: number;
-              percentage: string;
-              speed: number;
-              eta: number;
-            }) => {
-              fileBar.update(progress.uploaded, {
-                speed: `${formatBytes(progress.speed)}/s`,
-              });
-              fileBar.setTotal(progress.total);
-            }
-          );
-          fileBar.update(size, { speed: "Complete" });
+          await graphClient.uploadFileToSession(filePath, uploadSession);
         }
 
-        fileBar.update(size, { speed: "Complete" });
-        fileBar.stop();
-        activeBars.delete(relativePath);
-        overallBar.increment();
+        progressBar.increment();
       } catch (error) {
         failedCount++;
-        fileBar.stop();
-        activeBars.delete(relativePath);
-        overallBar.increment();
+        progressBar.increment();
         console.error(
           `\n❌ Failed to upload ${relativePath}:`,
           error instanceof Error ? error.message : error
@@ -401,7 +368,7 @@ async function handleUploadDirectory(
   }
 
   await queue.waitForCompletion();
-  multibar.stop();
+  progressBar.stop();
 
   const stats = queue.getStats();
   console.log(`\n${"=".repeat(100)}`);
