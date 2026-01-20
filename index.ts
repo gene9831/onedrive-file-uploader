@@ -325,6 +325,8 @@ async function handleUploadDirectory(
     {
       clearOnComplete: true,
       hideCursor: true,
+      stopOnComplete: false,
+      synchronousUpdate: false,
       format:
         " {bar} | {percentage}% | {value}/{total} | Speed: {speed} | {filename}",
       barCompleteChar: "\u2588",
@@ -339,6 +341,9 @@ async function handleUploadDirectory(
   });
 
   const activeBars = new Map<string, cliProgress.SingleBar>();
+  const lastUpdateTime = new Map<string, number>();
+  const UPDATE_THROTTLE_MS = 100;
+
   for (let i = 0; i < files.length; i++) {
     const { filePath, relativePath, size } = files[i]!;
     const fileDir = path.dirname(relativePath);
@@ -352,6 +357,7 @@ async function handleUploadDirectory(
         speed: "N/A",
       });
       activeBars.set(relativePath, fileBar);
+      lastUpdateTime.set(relativePath, Date.now());
 
       try {
         if (size <= MAX_DIRECT_UPLOAD_SIZE) {
@@ -373,23 +379,31 @@ async function handleUploadDirectory(
               speed: number;
               eta: number;
             }) => {
-              fileBar.update(progress.uploaded, {
-                speed: `${formatBytes(progress.speed)}/s`,
-              });
-              fileBar.setTotal(progress.total);
+              const now = Date.now();
+              const lastUpdate = lastUpdateTime.get(relativePath) || 0;
+              if (now - lastUpdate >= UPDATE_THROTTLE_MS) {
+                fileBar.update(progress.uploaded, {
+                  speed: `${formatBytes(progress.speed)}/s`,
+                });
+                fileBar.setTotal(progress.total);
+                lastUpdateTime.set(relativePath, now);
+              }
             }
           );
           fileBar.update(size, { speed: "Complete" });
         }
 
         fileBar.update(size, { speed: "Complete" });
+        await new Promise((resolve) => setTimeout(resolve, 50));
         fileBar.stop();
         activeBars.delete(relativePath);
+        lastUpdateTime.delete(relativePath);
         overallBar.increment();
       } catch (error) {
         failedCount++;
         fileBar.stop();
         activeBars.delete(relativePath);
+        lastUpdateTime.delete(relativePath);
         overallBar.increment();
         console.error(
           `\n❌ Failed to upload ${relativePath}:`,
