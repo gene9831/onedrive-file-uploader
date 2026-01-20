@@ -186,15 +186,22 @@ export class GraphClient {
   /**
    * Upload file directly to OneDrive (for small files)
    */
+  /**
+   * Upload file directly to OneDrive (for small files)
+   * Supports automatic retry on network errors and retryable HTTP status codes
+   * @param filePath Local file path
+   * @param directory Target directory in OneDrive
+   * @param userId Optional user ID (uses setUserId if not provided)
+   * @param maxRetries Maximum number of retries (default: 3)
+   */
   async uploadFile(
     filePath: string,
     directory: string,
-    userId?: string
+    userId?: string,
+    maxRetries: number = 3
   ): Promise<DriveItem> {
     const filename = path.basename(filePath);
     const file = Bun.file(filePath);
-    const accessToken = await this.getAccessToken();
-
     const normalizedDirectory = GraphClient.normalizeDirectory(directory);
     const targetUserId = userId ?? this.userId;
 
@@ -202,25 +209,36 @@ export class GraphClient {
       throw new Error("USER_ID must be provided or set via setUserId()");
     }
 
-    const response = await fetch(
-      `${this.baseUrl}/users/${targetUserId}/drive/items/root:${normalizedDirectory}${filename}:/content`,
-      {
-        method: "PUT",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": file.type,
-        },
-        body: Bun.file(filePath).stream(),
-      }
+    return await this.retryWithBackoff(
+      async () => {
+        const accessToken = await this.getAccessToken();
+
+        const response = await fetch(
+          `${this.baseUrl}/users/${targetUserId}/drive/items/root:${normalizedDirectory}${filename}:/content`,
+          {
+            method: "PUT",
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              "Content-Type": file.type,
+            },
+            body: Bun.file(filePath).stream(),
+          }
+        );
+
+        if (!response.ok) {
+          const error = new Error(
+            `Failed to upload file: ${response.status} ${response.statusText}`
+          );
+          (error as any).status = response.status;
+          throw error;
+        }
+
+        return (await response.json()) as DriveItem;
+      },
+      maxRetries,
+      1000,
+      30000
     );
-
-    if (!response.ok) {
-      throw new Error(
-        `Failed to upload file: ${response.status} ${response.statusText}`
-      );
-    }
-
-    return (await response.json()) as DriveItem;
   }
 
   /**
