@@ -552,20 +552,22 @@ export class GraphClient {
     }
   }
 
-  async listDirectory(
-    directory: string,
-    userId?: string
-  ): Promise<DriveItem[]> {
+  /**
+   * Get a single drive item by path
+   * @param itemPath Path to the item (file or folder)
+   * @param userId Optional user ID (uses setUserId if not provided)
+   */
+  async getItem(itemPath: string, userId?: string): Promise<DriveItem> {
     const accessToken = await this.getAccessToken();
-    const normalizedDirectory = GraphClient.normalizeDirectory(directory);
+    const normalizedPath = GraphClient.normalizeDirectory(itemPath);
     const targetUserId = userId ?? this.userId;
 
     if (!targetUserId) {
       throw new Error("USER_ID must be provided or set via setUserId()");
     }
 
-    const driveItemResp = await fetch(
-      `${this.baseUrl}/users/${targetUserId}/drive/items/root:${normalizedDirectory}`,
+    const response = await fetch(
+      `${this.baseUrl}/users/${targetUserId}/drive/items/root:${normalizedPath}`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -573,16 +575,32 @@ export class GraphClient {
       }
     );
 
-    if (!driveItemResp.ok) {
+    if (!response.ok) {
       throw new Error(
-        `Failed to list directory: ${driveItemResp.status} ${driveItemResp.statusText}\n${await driveItemResp.text()}`
+        `Failed to get item: ${response.status} ${response.statusText}\n${await response.text()}`
       );
     }
 
-    const fileId = ((await driveItemResp.json()) as DriveItem).id;
+    return (await response.json()) as DriveItem;
+  }
 
+  async listDirectory(
+    directory: string,
+    userId?: string
+  ): Promise<DriveItem[]> {
+    // Get the directory item first
+    const driveItem = await this.getItem(directory, userId);
+
+    const accessToken = await this.getAccessToken();
+    const targetUserId = userId ?? this.userId;
+
+    if (!targetUserId) {
+      throw new Error("USER_ID must be provided or set via setUserId()");
+    }
+
+    // Get children of the directory
     const childrenResp = await fetch(
-      `${this.baseUrl}/users/${targetUserId}/drive/items/${fileId}/children`,
+      `${this.baseUrl}/users/${targetUserId}/drive/items/${driveItem.id}/children`,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
